@@ -13,6 +13,8 @@ pub enum Error {
     ConsentNotFound = 406,
     ConsentAlreadyExists = 460,
     InvalidExpiry = 470,
+    BatchTooLarge = 471,
+    InvalidInput = 472,
 }
 
 #[allow(dead_code)]
@@ -24,5 +26,6 @@ pub fn get_suggestion(error: Error) -> Symbol {
         Error::InvalidPatient | Error::InvalidProvider => symbol_short!("CHK_ID"),
         Error::ConsentNotFound => symbol_short!("CHK_ID"),
         Error::ConsentAlreadyExists => symbol_short!("ALREADY"),
+        Error::BatchTooLarge | Error::InvalidInput => symbol_short!("CHK_ID"),
     }
 }

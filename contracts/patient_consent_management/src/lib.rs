@@ -148,11 +148,24 @@ impl PatientConsentManagement {
         Ok(())
     }
 
+    /// Maximum number of grantees allowed in a single batch operation.
+    const MAX_BATCH_SIZE: u32 = 50;
+
     /// Grant consent to multiple providers in a single transaction.
+    /// Validates batch size and input before processing.
     pub fn batch_grant_consent(env: Env, patient: Address, grantees: Vec<Address>) -> Result<u32, Error> {
         patient.require_auth();
         Self::require_initialized(&env)?;
         Self::require_not_paused(&env)?;
+
+        // Validate batch size
+        if grantees.len() == 0 {
+            return Err(Error::InvalidInput);
+        }
+        if grantees.len() > Self::MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+
         let ts = env.ledger().timestamp();
         let mut granted: u32 = 0;
         for provider in grantees.iter() {
