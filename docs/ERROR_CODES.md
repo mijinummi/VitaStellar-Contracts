@@ -584,6 +584,7 @@
 | 14 | ContractPaused | Generated from contract source |
 | 15 | StorageFull | Generated from contract source |
 | 16 | CrossChainTimeout | Generated from contract source |
+| 17 | ReplayDetected | Generated from contract source |
 
 ### pharma_supply_chain
 
@@ -771,6 +772,7 @@
 | 8 | AlreadyClaimed | Generated from contract source |
 | 9 | RefundsNotEnabled | Generated from contract source |
 | 10 | Paused | Generated from contract source |
+| 11 | ReplayDetected | Generated from contract source |
 
 ### upgrade_manager
 

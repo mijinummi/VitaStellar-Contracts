@@ -422,6 +422,30 @@ State Update → Event Emission → Cross-Chain Sync (if applicable)
 - Transaction ordering fairness
 - Gas optimization reviews
 
+#### 5.3 Payment Message Replay
+**Risk Level**: HIGH  
+**Attack Surface**: `payment_router::route_payment`, `token_sale::buy`, and downstream reputation accounting
+
+**Threat Description**: A bounced or duplicated transaction can be resubmitted with the same caller-bound arguments, causing duplicate payment routing, duplicate token sale allocation, and distorted treasury or reputation balances.
+
+**Attack Vectors**:
+- Replay of payment messages
+- Re-submission of bounced sale purchases
+- Out-of-order nonce submission by an integration client
+- Duplicate SDK retry without nonce advancement
+
+**Existing Mitigations**:
+- Caller-keyed `nonce_seq` counters in `payment_router` and `token_sale`
+- Strictly newer `next_nonce` validation with u64 wrap-around handling
+- `NonceConsumed` events for replay observability
+- `Error::ReplayDetected` rejection for stale or replayed nonces
+
+**Residual Risk**: LOW  
+**Recommendations**:
+- SDK wrappers should read the current nonce and submit `next_nonce = current + 1`
+- Healthcare reputation consumers should record the payment nonce in audit fields
+- Monitoring should alert on repeated `ReplayDetected` failures from the same caller
+
 ## Security Control Effectiveness
 
 ### Control Maturity Assessment
