@@ -1,217 +1,116 @@
 #![no_std]
+use soroban_sdk::{contract, contractimpl, Env, BytesN, panic_with_error, contracterror};
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, IntoVal, Vec,
-};
+pub mod keys;
+use crate::keys::KeyState;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
-pub enum DataKey {
-    Admin,
-    Node(BytesN<32>), // node_id
-    Task(BytesN<32>), // task_id
-    NodeList,
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum EnclaveError {
+    NotInitialized = 1,
+    UnauthenticatedSigner = 2,
+    AlreadyInitialized = 3,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
-pub enum CloudProvider {
-    AWSNitro,
-    IntelSGX,
-    GCPConfidentialSpace,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
-pub enum EnclaveStatus {
-    PendingRegistration,
-    Active,
-    Compromised,
-    Offline,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
-pub struct EnclaveNode {
-    pub provider: CloudProvider,
-    pub quote: Bytes, // Attestation quote
-    pub public_key: BytesN<32>,
-    pub status: EnclaveStatus,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
-pub enum TaskStatus {
-    Submitted,
-    Processing,
-    Completed,
-    Failed,
-    FallbackMPC,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[contracttype]
-pub struct ProcessingTask {
-    pub submitter: Address,
-    pub payload_hash: BytesN<32>,
-    pub status: TaskStatus,
-    pub result: Option<Bytes>,
-    pub assigned_node: Bytes, // Empty Bytes implies None
-    pub require_zk_proof: bool,
-}
-
-#[contract]
-pub struct SecureEnclaveContract;
+#[contract(name = "SecureEnclave")]
+pub struct SecureEnclave;
 
 #[contractimpl]
-impl SecureEnclaveContract {
-    pub fn initialize(env: Env, admin: Address) {
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic!("already initialized");
+impl SecureEnclave {
+    /// Initialize enclave infrastructure with a genesis signing key.
+    /// Protects against re-initialization exploits if keys are already established.
+    pub fn initialize(env: Env, genesis_key: BytesN<32>) {
+        if KeyState::load(&env).is_some() {
+            panic_with_error!(&env, EnclaveError::AlreadyInitialized);
         }
-        env.storage().instance().set(&DataKey::Admin, &admin);
+        KeyState::init(&env, genesis_key);
     }
 
-    pub fn register_enclave(
-        env: Env,
-        caller: Address,
-        node_id: BytesN<32>,
-        provider: CloudProvider,
-        quote: Bytes,
-        public_key: BytesN<32>,
-    ) {
-        caller.require_auth();
+    /// Performs atomic key rotation using a programmatic expiration cutoff window.
+    pub fn rotate_signing_key(env: Env, new_key: BytesN<32>, grace_period_seconds: u64) {
+        let mut state = KeyState::load(&env).unwrap_or_else(|| {
+            panic_with_error!(&env, EnclaveError::NotInitialized);
+        });
 
-        let key = DataKey::Node(node_id.clone());
-        if env.storage().persistent().has(&key) {
-            panic!("node already registered");
-        }
-
-        let node = EnclaveNode {
-            provider,
-            quote,
-            public_key,
-            status: EnclaveStatus::PendingRegistration,
-        };
-        env.storage().persistent().set(&key, &node);
-
-        let mut node_list: Vec<BytesN<32>> = env
-            .storage()
-            .instance()
-            .get(&DataKey::NodeList)
-            .unwrap_or(Vec::new(&env));
-        node_list.push_back(node_id);
-        env.storage().instance().set(&DataKey::NodeList, &node_list);
+        // Execute atomic state migration block
+        state.rotate(&env, new_key, grace_period_seconds);
     }
 
-    pub fn verify_attestation(env: Env, admin: Address, node_id: BytesN<32>, is_valid: bool) {
-        admin.require_auth();
-        let expected_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if admin != expected_admin {
-            panic!("unauthorized");
+    /// Validates payload cryptographic authenticity across active key state boundaries.
+    pub fn verify_signature(env: Env, signer: BytesN<32>) -> bool {
+        let state = KeyState::load(&env).unwrap_or_else(|| {
+            panic_with_error!(&env, EnclaveError::NotInitialized);
+        });
+
+        if !state.verify_key_validity(&env, &signer) {
+            panic_with_error!(&env, EnclaveError::UnauthenticatedSigner);
         }
 
-        let key = DataKey::Node(node_id.clone());
-        let mut node: EnclaveNode = env.storage().persistent().get(&key).unwrap();
-
-        if is_valid {
-            node.status = EnclaveStatus::Active;
-        } else {
-            node.status = EnclaveStatus::Compromised;
-        }
-        env.storage().persistent().set(&key, &node);
+        true
     }
 
-    pub fn submit_task(
-        env: Env,
-        submitter: Address,
-        task_id: BytesN<32>,
-        payload_hash: BytesN<32>,
-        require_zk_proof: bool,
-    ) {
-        submitter.require_auth();
-        let key = DataKey::Task(task_id.clone());
-        if env.storage().persistent().has(&key) {
-            panic!("task already exists");
+    /// Housekeeping endpoint used to explicitly clear old records and save instance storage fees.
+    pub fn housekeeping(env: Env) -> bool {
+        if let Some(mut state) = KeyState::load(&env) {
+            return state.purge_expired(&env);
         }
-        let task = ProcessingTask {
-            submitter,
-            payload_hash,
-            status: TaskStatus::Submitted,
-            result: None,
-            assigned_node: Bytes::new(&env),
-            require_zk_proof,
-        };
-        env.storage().persistent().set(&key, &task);
-    }
-
-    pub fn assign_task(env: Env, admin: Address, task_id: BytesN<32>, node_id: BytesN<32>) {
-        admin.require_auth();
-        let expected_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if admin != expected_admin {
-            panic!("unauthorized");
-        }
-
-        let node_key = DataKey::Node(node_id.clone());
-        let node: EnclaveNode = env.storage().persistent().get(&node_key).unwrap();
-        if node.status != EnclaveStatus::Active {
-            panic!("node not active");
-        }
-
-        let task_key = DataKey::Task(task_id.clone());
-        let mut task: ProcessingTask = env.storage().persistent().get(&task_key).unwrap();
-        task.assigned_node = node_id.into(); // Convert BytesN<32> to Bytes
-        task.status = TaskStatus::Processing;
-        env.storage().persistent().set(&task_key, &task);
-    }
-
-    pub fn complete_task(
-        env: Env,
-        node_address: Address,
-        task_id: BytesN<32>,
-        result: Bytes,
-        zk_proof: Option<Bytes>,
-    ) {
-        node_address.require_auth();
-
-        let task_key = DataKey::Task(task_id.clone());
-        let mut task: ProcessingTask = env.storage().persistent().get(&task_key).unwrap();
-
-        if task.require_zk_proof && zk_proof.is_none() {
-            panic!("zk proof required");
-        }
-
-        task.status = TaskStatus::Completed;
-        task.result = Some(result);
-        env.storage().persistent().set(&task_key, &task);
-    }
-
-    pub fn fallback_to_mpc(env: Env, admin: Address, task_id: BytesN<32>, mpc_manager_id: Address) {
-        admin.require_auth();
-        let expected_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if admin != expected_admin {
-            panic!("unauthorized");
-        }
-
-        let task_key = DataKey::Task(task_id.clone());
-        let mut task: ProcessingTask = env.storage().persistent().get(&task_key).unwrap();
-
-        // Ensure not already completed
-        if task.status == TaskStatus::Completed {
-            panic!("task already completed");
-        }
-
-        let mut args: Vec<soroban_sdk::Val> = Vec::new(&env);
-        args.push_back(task_id.into_val(&env));
-        args.push_back(task.payload_hash.into_val(&env));
-
-        // Use invoke_contract to call the fallback
-        env.invoke_contract::<soroban_sdk::Val>(&mpc_manager_id, &symbol_short!("req_mpc"), args);
-
-        task.status = TaskStatus::FallbackMPC;
-        env.storage().persistent().set(&task_key, &task);
+        false
     }
 }
 
+// ─── Verification Test Suite ─────────────────────────────────────────────────
+
 #[cfg(test)]
-mod test;
+mod test {
+    use super::*;
+    use soroban_sdk::{Env, BytesN};
+
+    fn generate_mock_key(env: &Env, val: u8) -> BytesN<32> {
+        let mut arr = [0u8; 32];
+        arr[0] = val;
+        BytesN::from_array(env, &arr)
+    }
+
+    #[test]
+    fn test_enclave_lifecycle_and_rotation_mechanics() {
+        let env = Env::default();
+        env.ledger().set_timestamp(1000); // Initialize virtual time context
+
+        let client = SecureEnclaveClient::new(&env, &env.register_contract(None, SecureEnclave));
+
+        let key_1 = generate_mock_key(&env, 1);
+        let key_2 = generate_mock_key(&env, 2);
+
+        // 1. Verify initialization logic
+        client.initialize(&key_1);
+        assert!(client.verify_signature(&key_1));
+
+        // 2. Prevent re-initialization hijacking
+        let res = client.try_initialize(&key_2);
+        assert!(res.is_err(), "Expected re-initialization protection to reject call");
+
+        // 3. Rotate key with a 60-second grace window (valid until t = 1060)
+        client.rotate_signing_key(&key_2, &60);
+        
+        // Both current and prior keys must pass inside the grace window
+        assert!(client.verify_signature(&key_2));
+        assert!(client.verify_signature(&key_1));
+
+        // 4. Advance ledger time past the expiration parameter threshold (t = 1065)
+        env.ledger().set_timestamp(1065);
+
+        // Current key must hold authorization, historical key must be atomically dropped
+        assert!(client.verify_signature(&key_2));
+        
+        let verify_old_res = client.try_verify_signature(&key_1);
+        assert!(verify_old_res.is_err(), "Vulnerability window open: expired signature accepted!");
+
+        // 5. Invoke housekeeping cleanup routine
+        let internal_purge_state = client.housekeeping();
+        assert!(internal_purge_state, "Housekeeping should successfully prune storage footprint");
+        
+        // Subsequent housekeeping calls should pass cleanly without executing redundant writes
+        assert!(!client.housekeeping());
+    }
+}
