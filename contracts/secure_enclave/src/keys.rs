@@ -1,10 +1,11 @@
-use soroban_sdk::{contracttype, Env, BytesN};
+use soroban_sdk::{contracttype, BytesN, Env};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyState {
     pub current_key: BytesN<32>,
-    pub previous_key: Option<BytesN<32>>,
+    pub previous_key: BytesN<32>,
+    pub has_previous_key: bool,
     pub previous_expires_at: u64,
 }
 
@@ -16,12 +17,16 @@ pub enum DataKey {
 impl KeyState {
     /// Initializes the state engine with a primary genesis key.
     pub fn init(env: &Env, key: BytesN<32>) -> Self {
+        let zero_key = BytesN::from_array(env, &[0u8; 32]);
         let state = KeyState {
             current_key: key,
-            previous_key: None,
+            previous_key: zero_key,
+            has_previous_key: false,
             previous_expires_at: 0,
         };
-        env.storage().instance().set(&DataKey::SigningKeyState, &state);
+        env.storage()
+            .instance()
+            .set(&DataKey::SigningKeyState, &state);
         state
     }
 
@@ -33,13 +38,16 @@ impl KeyState {
     /// Atomically rotates the keys and sets an absolute ledger expiration timestamp.
     pub fn rotate(&mut self, env: &Env, new_key: BytesN<32>, grace_period: u64) {
         let current_ledger_time = env.ledger().timestamp();
-        
-        // Atomically shift the key positions
-        self.previous_key = Some(self.current_key.clone());
+
+        // Safe atomic migration using structural flags
+        self.previous_key = self.current_key.clone();
+        self.has_previous_key = true;
         self.previous_expires_at = current_ledger_time.saturating_add(grace_period);
         self.current_key = new_key;
 
-        env.storage().instance().set(&DataKey::SigningKeyState, self);
+        env.storage()
+            .instance()
+            .set(&DataKey::SigningKeyState, self);
     }
 
     /// Assesses whether a given public key is valid under current ledger state rules.
@@ -49,12 +57,10 @@ impl KeyState {
             return true;
         }
 
-        // Condition 2: Evaluate the previous key against absolute ledger time boundaries
-        if let Some(ref prev_key) = self.previous_key {
-            if prev_key == public_key {
-                let current_ledger_time = env.ledger().timestamp();
-                return current_ledger_time < self.previous_expires_at;
-            }
+        // Condition 2: Evaluate the previous key against ledger time boundaries if active
+        if self.has_previous_key && &self.previous_key == public_key {
+            let current_ledger_time = env.ledger().timestamp();
+            return current_ledger_time < self.previous_expires_at;
         }
 
         false
@@ -62,10 +68,14 @@ impl KeyState {
 
     /// Purges the historical tracking slot if it has passed its expiration deadline.
     pub fn purge_expired(&mut self, env: &Env) -> bool {
-        if self.previous_key.is_some() && env.ledger().timestamp() >= self.previous_expires_at {
-            self.previous_key = None;
+        if self.has_previous_key && env.ledger().timestamp() >= self.previous_expires_at {
+            let zero_key = BytesN::from_array(env, &[0u8; 32]);
+            self.previous_key = zero_key;
+            self.has_previous_key = false;
             self.previous_expires_at = 0;
-            env.storage().instance().set(&DataKey::SigningKeyState, self);
+            env.storage()
+                .instance()
+                .set(&DataKey::SigningKeyState, self);
             return true; // Pruned
         }
         false
